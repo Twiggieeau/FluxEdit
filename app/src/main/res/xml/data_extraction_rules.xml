@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="flux2-klein-4b"/>
+    </cloud-backup>
+    <device-transfer>
+        <include domain="file" path="flux2-klein-4b"/>
+    </device-transfer>
+</data-extraction-rules>

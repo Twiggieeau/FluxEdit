@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">FluxEdit</string>
+    <string name="model_title">FLUX.2 Klein 4B</string>
+    <string name="single_image_edit">Image Edit</string>
+    <string name="two_image_blend">Blend &amp; Compose</string>
+    <string name="text_to_image">Text-to-Image</string>
+    <string name="generate_button">Generate</string>
+    <string name="prompt_hint">Describe your edits or scene…</string>
+</resources>

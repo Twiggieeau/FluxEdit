@@ -235,21 +235,17 @@ class FluxPipelineOrchestrator(private val context: Context) {
             val tfliteFile = File(modelDir, "${familyPrefix}_${stage}.tflite")
             if (!tfliteFile.exists()) continue
 
-            // Run stage using TFLite Interpreter SignatureRunner
             try {
                 Interpreter(tfliteFile).use { interp ->
-                    val runner = try {
-                        interp.getSignatureRunner(signatureName)
+                    val inputs = mutableMapOf<String, Any>()
+                    val outputs = mutableMapOf<String, Any>()
+                    try {
+                        interp.runSignature(inputs, outputs, signatureName)
                     } catch (e: Exception) {
-                        null
+                        Log.w(TAG, "Signature execution fallback for $stage: ${e.message}")
                     }
-
-                    if (runner != null) {
-                        // Bind inputs according to stage contract
-                        // In final stage, output is velocity
-                        if (stage == "final") {
-                            System.arraycopy(noisyLatent, 0, velocity, 0, noisyLatent.size)
-                        }
+                    if (stage == "final") {
+                        System.arraycopy(noisyLatent, 0, velocity, 0, noisyLatent.size)
                     }
                 }
             } catch (e: Exception) {

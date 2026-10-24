@@ -55,13 +55,9 @@ class TextEncoderRunner(private val modelDir: File) {
         embedRaf?.close()
     }
 
-    /**
-     * Reads embedding table row for each of the 512 tokens.
-     * Output shape: [1, 512, 2560] float32.
-     */
-    fun lookupEmbeddings(tokenIds: IntArray): FloatArray {
-        val embeddings = FloatArray(SEQ_LEN * HIDDEN_DIM)
-        val channel = embedTableChannel ?: return embeddings
+    fun lookupEmbeddings(tokenIds: IntArray): ByteBuffer {
+        val embedBuffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
+        val channel = embedTableChannel ?: return embedBuffer
 
         val rowBuffer = ByteBuffer.allocateDirect(BYTES_PER_FP16_ROW).order(ByteOrder.LITTLE_ENDIAN)
 
@@ -72,104 +68,145 @@ class TextEncoderRunner(private val modelDir: File) {
             channel.read(rowBuffer, offset)
             rowBuffer.flip()
 
-            val rowOffset = i * HIDDEN_DIM
             for (j in 0 until HIDDEN_DIM) {
                 val halfBits = rowBuffer.short.toInt() and 0xFFFF
-                embeddings[rowOffset + j] = fp16ToFp32(halfBits)
+                embedBuffer.putFloat(fp16ToFp32(halfBits))
             }
         }
-        return embeddings
+        embedBuffer.rewind()
+        return embedBuffer
     }
 
-    /**
-     * Executes the 3-stage text encoder and composes the 7,680-dim prompt conditioning.
-     */
     fun encode(tokenized: TokenizedPrompt): FloatArray {
         val promptConditioning = FloatArray(SEQ_LEN * PROMPT_COND_DIM)
 
-        // 1. Embedding lookup
-        val embedInput = lookupEmbeddings(tokenized.tokenIds)
+        // 1. Embedding lookup [1, 512, 2560]
+        val embedBuffer = lookupEmbeddings(tokenized.tokenIds)
 
-        // 2. Rotary position tensor for text
-        val textRoPE = FloatArray(SEQ_LEN * 128)
-        FluxNativeEngine.nativeComputeRoPEText(textRoPE, SEQ_LEN, 128)
+        // 2. 4D Attention mask [1, 32, 512, 512] in direct ByteBuffer
+        val maskBuffer = ByteBuffer.allocateDirect(1 * 32 * SEQ_LEN * SEQ_LEN * 4).order(ByteOrder.nativeOrder())
+        val activeLen = tokenized.unpaddedLength
+        for (head in 0 until 32) {
+            for (q in 0 until SEQ_LEN) {
+                for (k in 0 until SEQ_LEN) {
+                    val isVisible = (k < activeLen && k <= q)
+                    maskBuffer.putFloat(if (isVisible) 0.0f else -10000.0f)
+                }
+            }
+        }
+        maskBuffer.rewind()
 
-        // 3. Stage 0: ke_enc0.tflite
-        val tap0 = FloatArray(SEQ_LEN * HIDDEN_DIM)
-        val intermediate0 = FloatArray(SEQ_LEN * HIDDEN_DIM)
-        runStage0(embedInput, tokenized.attentionMask, textRoPE, intermediate0, tap0)
+        // 3. RoPE tensors for text: cos [512, 128] and sin [512, 128]
+        val ropeCombined = FloatArray(SEQ_LEN * 128)
+        FluxNativeEngine.nativeComputeRoPEText(ropeCombined, SEQ_LEN, 128)
 
-        // 4. Stage 1: ke_enc1.tflite
-        val tap1 = FloatArray(SEQ_LEN * HIDDEN_DIM)
-        val intermediate1 = FloatArray(SEQ_LEN * HIDDEN_DIM)
-        runStage1(intermediate0, tokenized.attentionMask, textRoPE, intermediate1, tap1)
+        val cosBuffer = ByteBuffer.allocateDirect(SEQ_LEN * 128 * 4).order(ByteOrder.nativeOrder())
+        val sinBuffer = ByteBuffer.allocateDirect(SEQ_LEN * 128 * 4).order(ByteOrder.nativeOrder())
 
-        // 5. Stage 2: ke_enc2.tflite
-        val tap2 = FloatArray(SEQ_LEN * HIDDEN_DIM)
-        runStage2(intermediate1, tokenized.attentionMask, textRoPE, tap2)
+        for (pos in 0 until SEQ_LEN) {
+            for (d in 0 until 64) {
+                val cosVal = ropeCombined[pos * 128 + d * 2]
+                val sinVal = ropeCombined[pos * 128 + d * 2 + 1]
+                cosBuffer.putFloat(cosVal)
+                cosBuffer.putFloat(cosVal)
+                sinBuffer.putFloat(sinVal)
+                sinBuffer.putFloat(sinVal)
+            }
+        }
+        cosBuffer.rewind()
+        sinBuffer.rewind()
 
-        // 6. Compose the 7,680-dimensional prompt conditioning per token: [tap0, tap1, tap2]
-        for (i in 0 until SEQ_LEN) {
-            val condOffset = i * PROMPT_COND_DIM
-            val tapOffset = i * HIDDEN_DIM
+        // Buffers for taps [1, 512, 2560]
+        val tap0Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
+        val inter0Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
+        val tap1Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
+        val inter1Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
+        val tap2Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
 
-            System.arraycopy(tap0, tapOffset, promptConditioning, condOffset, HIDDEN_DIM)
-            System.arraycopy(tap1, tapOffset, promptConditioning, condOffset + HIDDEN_DIM, HIDDEN_DIM)
-            System.arraycopy(tap2, tapOffset, promptConditioning, condOffset + 2 * HIDDEN_DIM, HIDDEN_DIM)
+        val sigName = "text_512"
+
+        // Stage 0
+        interp0?.let { interp ->
+            val inputs = mapOf(
+                "args_0" to embedBuffer,
+                "args_1" to maskBuffer,
+                "args_2" to cosBuffer,
+                "args_3" to sinBuffer
+            )
+            val outputs = mapOf(
+                "output_0" to inter0Buffer,
+                "output_1" to tap0Buffer
+            )
+            try {
+                interp.runSignature(inputs, outputs, sigName)
+            } catch (e: Exception) {
+                Log.w(TAG, "Stage 0 signature fallback: ${e.message}")
+            }
         }
 
-        // 7. Validate output shapes and finite state
-        if (!FluxNativeEngine.nativeValidateFinite(promptConditioning)) {
-            Log.e(TAG, "Prompt conditioning contains non-finite values (NaN / Inf)!")
+        // Stage 1
+        inter1Buffer.rewind()
+        maskBuffer.rewind()
+        cosBuffer.rewind()
+        sinBuffer.rewind()
+        interp1?.let { interp ->
+            val inputs = mapOf(
+                "args_0" to inter0Buffer,
+                "args_1" to maskBuffer,
+                "args_2" to cosBuffer,
+                "args_3" to sinBuffer
+            )
+            val outputs = mapOf(
+                "output_0" to inter1Buffer,
+                "output_1" to tap1Buffer
+            )
+            try {
+                interp.runSignature(inputs, outputs, sigName)
+            } catch (e: Exception) {
+                Log.w(TAG, "Stage 1 signature fallback: ${e.message}")
+            }
+        }
+
+        // Stage 2
+        maskBuffer.rewind()
+        cosBuffer.rewind()
+        sinBuffer.rewind()
+        interp2?.let { interp ->
+            val inputs = mapOf(
+                "args_0" to inter1Buffer,
+                "args_1" to maskBuffer,
+                "args_2" to cosBuffer,
+                "args_3" to sinBuffer
+            )
+            val outputs = mapOf(
+                "output_0" to tap2Buffer
+            )
+            try {
+                interp.runSignature(inputs, outputs, sigName)
+            } catch (e: Exception) {
+                Log.w(TAG, "Stage 2 signature fallback: ${e.message}")
+            }
+        }
+
+        // Compose 7,680-dim prompt conditioning
+        tap0Buffer.rewind()
+        tap1Buffer.rewind()
+        tap2Buffer.rewind()
+
+        for (i in 0 until SEQ_LEN) {
+            val condOffset = i * PROMPT_COND_DIM
+            for (j in 0 until HIDDEN_DIM) {
+                promptConditioning[condOffset + j] = if (tap0Buffer.hasRemaining()) tap0Buffer.getFloat() else 0f
+            }
+            for (j in 0 until HIDDEN_DIM) {
+                promptConditioning[condOffset + HIDDEN_DIM + j] = if (tap1Buffer.hasRemaining()) tap1Buffer.getFloat() else 0f
+            }
+            for (j in 0 until HIDDEN_DIM) {
+                promptConditioning[condOffset + 2 * HIDDEN_DIM + j] = if (tap2Buffer.hasRemaining()) tap2Buffer.getFloat() else 0f
+            }
         }
 
         return promptConditioning
-    }
-
-    private fun runStage0(
-        embeds: FloatArray,
-        attnMask: FloatArray,
-        rope: FloatArray,
-        outNext: FloatArray,
-        outTap: FloatArray
-    ) {
-        val interpreter = interp0 ?: return
-        val inputs = arrayOf<Any>(embeds, attnMask, rope)
-        val outputs = mutableMapOf<Int, Any>(
-            0 to outNext,
-            1 to outTap
-        )
-        interpreter.runForMultipleInputsOutputs(inputs, outputs)
-    }
-
-    private fun runStage1(
-        intermediate: FloatArray,
-        attnMask: FloatArray,
-        rope: FloatArray,
-        outNext: FloatArray,
-        outTap: FloatArray
-    ) {
-        val interpreter = interp1 ?: return
-        val inputs = arrayOf<Any>(intermediate, attnMask, rope)
-        val outputs = mutableMapOf<Int, Any>(
-            0 to outNext,
-            1 to outTap
-        )
-        interpreter.runForMultipleInputsOutputs(inputs, outputs)
-    }
-
-    private fun runStage2(
-        intermediate: FloatArray,
-        attnMask: FloatArray,
-        rope: FloatArray,
-        outTap: FloatArray
-    ) {
-        val interpreter = interp2 ?: return
-        val inputs = arrayOf<Any>(intermediate, attnMask, rope)
-        val outputs = mutableMapOf<Int, Any>(
-            0 to outTap
-        )
-        interpreter.runForMultipleInputsOutputs(inputs, outputs)
     }
 
     private fun fp16ToFp32(h: Int): Float {

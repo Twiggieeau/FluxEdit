@@ -6,6 +6,8 @@ import android.util.Log
 import com.gestura.fluxedit.engine.FluxNativeEngine
 import org.tensorflow.lite.Interpreter
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class VaePipeline(private val modelDir: File) {
     private val TAG = "VaePipeline"
@@ -31,43 +33,67 @@ class VaePipeline(private val modelDir: File) {
     }
 
     /**
-     * Encodes an input Bitmap to a packed latent tensor [numTokens, 128].
+     * Encodes an input Bitmap to a packed latent tensor [numTokens, 128]
+     * using the exact geometry SignatureDef and direct ByteBuffers.
      */
     fun encodeImageToPackedLatent(bitmap: Bitmap, targetWidth: Int, targetHeight: Int): FloatArray {
-        // 1. Resize image to exact geometry
+        // 1. Resize image to target geometry
         val scaled = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
 
-        // 2 & 3 & 4. Convert to planar RGB [-1.0, 1.0]
-        // Planar format: [1, 3, H, W]
-        val planarRgb = FloatArray(3 * targetHeight * targetWidth)
-        val pixels = IntArray(targetWidth * targetHeight)
+        // 2 & 3. Planar RGB [-1.0, 1.0] in a direct ByteBuffer to preserve 4D tensor shape [1, 3, H, W]
+        val planeSize = targetHeight * targetWidth
+        val pixels = IntArray(planeSize)
         scaled.getPixels(pixels, 0, targetWidth, 0, 0, targetWidth, targetHeight)
 
-        val planeSize = targetHeight * targetWidth
+        val inputByteBuffer = ByteBuffer.allocateDirect(1 * 3 * planeSize * 4).order(ByteOrder.nativeOrder())
+        
+        // Channel R
         for (i in 0 until planeSize) {
-            val color = pixels[i]
-            val r = Color.red(color)
-            val g = Color.green(color)
-            val b = Color.blue(color)
-
-            planarRgb[i] = (r / 127.5f) - 1.0f
-            planarRgb[planeSize + i] = (g / 127.5f) - 1.0f
-            planarRgb[2 * planeSize + i] = (b / 127.5f) - 1.0f
+            inputByteBuffer.putFloat((Color.red(pixels[i]) / 127.5f) - 1.0f)
         }
+        // Channel G
+        for (i in 0 until planeSize) {
+            inputByteBuffer.putFloat((Color.green(pixels[i]) / 127.5f) - 1.0f)
+        }
+        // Channel B
+        for (i in 0 until planeSize) {
+            inputByteBuffer.putFloat((Color.blue(pixels[i]) / 127.5f) - 1.0f)
+        }
+        inputByteBuffer.rewind()
 
-        // 5. Run VAE encoder: produces [1, 32, H/8, W/8] latent
+        // 4. Output buffer for [1, 32, H/8, W/8]
         val hLatent = targetHeight / 8
         val wLatent = targetWidth / 8
-        val vaeLatent = FloatArray(32 * hLatent * wLatent)
+        val latentElements = 32 * hLatent * wLatent
+        val outputByteBuffer = ByteBuffer.allocateDirect(latentElements * 4).order(ByteOrder.nativeOrder())
 
+        // 5. Invoke using SignatureDef "geometry_{W}x{H}"
         val interpreter = encInterpreter
         if (interpreter != null) {
-            val inputs = arrayOf<Any>(planarRgb)
-            val outputs = mutableMapOf<Int, Any>(0 to vaeLatent)
-            interpreter.runForMultipleInputsOutputs(inputs, outputs)
+            val signatureName = "geometry_${targetWidth}x${targetHeight}"
+            val inputs = mapOf("args_0" to inputByteBuffer)
+            val outputs = mapOf("output_0" to outputByteBuffer)
+
+            try {
+                interpreter.runSignature(inputs, outputs, signatureName)
+            } catch (e: Exception) {
+                Log.w(TAG, "Signature $signatureName execution fallback: ${e.message}")
+                inputByteBuffer.rewind()
+                outputByteBuffer.rewind()
+                val legacyInputs = arrayOf<Any>(inputByteBuffer)
+                val legacyOutputs = mutableMapOf<Int, Any>(0 to outputByteBuffer)
+                interpreter.runForMultipleInputsOutputs(legacyInputs, legacyOutputs)
+            }
         }
 
-        // 6. Patchify & pack into width-128 tokens
+        // 6. Extract VAE latent float array
+        outputByteBuffer.rewind()
+        val vaeLatent = FloatArray(latentElements)
+        for (i in 0 until latentElements) {
+            vaeLatent[i] = outputByteBuffer.getFloat()
+        }
+
+        // 7. Patchify & pack into width-128 tokens
         val numTokens = (targetHeight / 16) * (targetWidth / 16)
         val packedTokens = FloatArray(numTokens * 128)
         FluxNativeEngine.nativePatchifyLatent(vaeLatent, packedTokens, targetHeight, targetWidth)
@@ -82,23 +108,43 @@ class VaePipeline(private val modelDir: File) {
         // 1. Unpack width-128 latent to [1, 32, H/8, W/8]
         val hLatent = height / 8
         val wLatent = width / 8
-        val vaeLatent = FloatArray(32 * hLatent * wLatent)
+        val latentElements = 32 * hLatent * wLatent
+        val vaeLatent = FloatArray(latentElements)
         FluxNativeEngine.nativeUnpatchifyLatent(packedTokens, vaeLatent, height, width)
 
-        // 2 & 3. Invoke kv_vae.tflite -> planar RGB [-1.0, 1.0]
-        val planeSize = height * width
-        val planarRgb = FloatArray(3 * planeSize)
+        val inputByteBuffer = ByteBuffer.allocateDirect(latentElements * 4).order(ByteOrder.nativeOrder())
+        for (v in vaeLatent) {
+            inputByteBuffer.putFloat(v)
+        }
+        inputByteBuffer.rewind()
 
-        val interpreter = decInterpreter
-        if (interpreter != null) {
-            val inputs = arrayOf<Any>(vaeLatent)
-            val outputs = mutableMapOf<Int, Any>(0 to planarRgb)
-            interpreter.runForMultipleInputsOutputs(inputs, outputs)
-        } else {
-            return null
+        // 2. Planar RGB output buffer [1, 3, H, W]
+        val planeSize = height * width
+        val outputByteBuffer = ByteBuffer.allocateDirect(1 * 3 * planeSize * 4).order(ByteOrder.nativeOrder())
+
+        val interpreter = decInterpreter ?: return null
+        val signatureName = "geometry_${width}x${height}"
+        val inputs = mapOf("args_0" to inputByteBuffer)
+        val outputs = mapOf("output_0" to outputByteBuffer)
+
+        try {
+            interpreter.runSignature(inputs, outputs, signatureName)
+        } catch (e: Exception) {
+            Log.w(TAG, "Decoder signature $signatureName execution fallback: ${e.message}")
+            inputByteBuffer.rewind()
+            outputByteBuffer.rewind()
+            val legacyInputs = arrayOf<Any>(inputByteBuffer)
+            val legacyOutputs = mutableMapOf<Int, Any>(0 to outputByteBuffer)
+            interpreter.runForMultipleInputsOutputs(legacyInputs, legacyOutputs)
         }
 
-        // 4 & 5. Reject NaN or Infinity, map [-1, 1] to RGB pixel range
+        outputByteBuffer.rewind()
+        val planarRgb = FloatArray(3 * planeSize)
+        for (i in 0 until 3 * planeSize) {
+            planarRgb[i] = outputByteBuffer.getFloat()
+        }
+
+        // 3. Reject NaN/Inf and map [-1, 1] to RGB Bitmap
         if (!FluxNativeEngine.nativeValidateFinite(planarRgb)) {
             Log.e(TAG, "Decoded image contains non-finite values (NaN / Inf)!")
             return null

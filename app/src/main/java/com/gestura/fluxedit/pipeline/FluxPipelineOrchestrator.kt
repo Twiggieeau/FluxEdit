@@ -10,6 +10,8 @@ import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.TensorBuffer
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.exp
@@ -54,9 +56,11 @@ class FluxPipelineOrchestrator(private val context: Context) {
         File(context.filesDir, "flux2-klein-4b")
     }
 
+    private val initMutex = Mutex()
     private val tokenizer = QwenBpeTokenizer()
     private var textEncoder: TextEncoderRunner? = null
     private var vaePipeline: VaePipeline? = null
+    @Volatile
     private var isInitialized = false
 
     companion object {
@@ -101,32 +105,36 @@ class FluxPipelineOrchestrator(private val context: Context) {
     }
 
     suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
-        if (!ModelManifest.isFullyInstalled(modelDir)) {
-            Log.w(TAG, "Model assets not fully installed yet in $modelDir")
-            return@withContext false
-        }
+        initMutex.withLock {
+            if (isInitialized) return@withLock true
 
-        try {
-            // Load tokenizer files
-            tokenizer.loadFromFiles(
-                vocabFile = File(modelDir, "tokenizer/qwen_vocab.txt"),
-                mergesFile = File(modelDir, "tokenizer/qwen_merges.txt"),
-                specialFile = File(modelDir, "tokenizer/qwen_special.txt")
-            )
+            if (!ModelManifest.isFullyInstalled(modelDir)) {
+                Log.w(TAG, "Model assets not fully installed yet in $modelDir")
+                return@withLock false
+            }
 
-            // Init native engine
-            FluxNativeEngine.nativeInit(modelDir.absolutePath)
+            try {
+                // Load tokenizer files
+                tokenizer.loadFromFiles(
+                    vocabFile = File(modelDir, "tokenizer/qwen_vocab.txt"),
+                    mergesFile = File(modelDir, "tokenizer/qwen_merges.txt"),
+                    specialFile = File(modelDir, "tokenizer/qwen_special.txt")
+                )
 
-            // Init text encoder and VAE
-            textEncoder = TextEncoderRunner(modelDir).also { it.init() }
-            vaePipeline = VaePipeline(modelDir).also { it.init() }
+                // Init native engine (20 MB time_guidance_embed_bf16.bin)
+                FluxNativeEngine.nativeInit(modelDir.absolutePath)
 
-            isInitialized = true
-            Log.i(TAG, "FluxPipelineOrchestrator successfully initialized")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Initialization failed", e)
-            false
+                // Lightweight wrappers (models are loaded on-demand per stage and closed immediately)
+                textEncoder = TextEncoderRunner(modelDir)
+                vaePipeline = VaePipeline(modelDir)
+
+                isInitialized = true
+                Log.i(TAG, "FluxPipelineOrchestrator successfully initialized")
+                true
+            } catch (t: Throwable) {
+                Log.e(TAG, "Initialization failed", t)
+                false
+            }
         }
     }
 
@@ -136,24 +144,35 @@ class FluxPipelineOrchestrator(private val context: Context) {
     ): Bitmap? = withContext(Dispatchers.Default) {
         val startTime = System.currentTimeMillis()
 
-        if (!isInitialized) {
-            onProgress(PipelineProgress.Error("Models are not yet loaded. Please download or import assets."))
-            return@withContext null
-        }
-
         try {
-            // 1. Text Tokenization
+            // Check installed files and lazily initialize if needed
+            val missingFiles = ModelManifest.checkInstalledFiles(modelDir).filter { !it.second }
+            if (missingFiles.isNotEmpty()) {
+                val firstMissing = missingFiles.first().first.relativePath
+                onProgress(
+                    PipelineProgress.Error(
+                        "Missing ${missingFiles.size} model file(s) (e.g. $firstMissing). Please finish downloading in the Models tab."
+                    )
+                )
+                return@withContext null
+            }
+
             onProgress(PipelineProgress.Tokenizing)
+            if (!isInitialized) {
+                val ok = initialize()
+                if (!ok) {
+                    onProgress(PipelineProgress.Error("Failed to initialize tokenizer and native engine."))
+                    return@withContext null
+                }
+            }
+
+            // 1. Text Tokenization
             val tokenized = tokenizer.encodePromptWithTemplate(params.prompt)
 
             // 2. 3-Stage Text Encoding (ke_enc0 -> ke_enc1 -> ke_enc2)
             onProgress(PipelineProgress.EncodingText)
-            val runner = textEncoder ?: TextEncoderRunner(modelDir).also {
-                it.init()
-                textEncoder = it
-            }
+            val runner = textEncoder ?: TextEncoderRunner(modelDir).also { textEncoder = it }
             val promptCond = runner.encode(tokenized)
-            // Free 3-stage text encoder interpreters before running the 8-stage DiT pipeline to conserve RAM
             runner.close()
             textEncoder = null
 
@@ -287,9 +306,9 @@ class FluxPipelineOrchestrator(private val context: Context) {
             val duration = System.currentTimeMillis() - startTime
             onProgress(PipelineProgress.Completed(resultBitmap, duration))
             resultBitmap
-        } catch (e: Exception) {
-            Log.e(TAG, "Generation error", e)
-            onProgress(PipelineProgress.Error(e.message ?: "Generation error"))
+        } catch (t: Throwable) {
+            Log.e(TAG, "Generation error", t)
+            onProgress(PipelineProgress.Error(t.message ?: t.javaClass.simpleName))
             null
         }
     }

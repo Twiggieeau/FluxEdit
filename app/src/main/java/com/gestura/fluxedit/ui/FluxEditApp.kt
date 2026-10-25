@@ -53,11 +53,9 @@ fun FluxEditApp() {
         mutableStateOf(ModelManifest.isFullyInstalled(downloadManager.getModelDirectory()))
     }
 
-    // Initialize engine when models are ready
-    LaunchedEffect(isModelReady) {
-        if (isModelReady) {
-            orchestrator.initialize()
-        }
+    // Refresh model installation status when switching tabs or when download state changes
+    LaunchedEffect(currentDestination, downloadState) {
+        isModelReady = ModelManifest.isFullyInstalled(downloadManager.getModelDirectory())
     }
 
     Scaffold(

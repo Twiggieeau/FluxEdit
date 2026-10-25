@@ -26,12 +26,14 @@ bool FluxEngine::initialize(const std::string& modelDir) {
     modelDirectory = modelDir;
     LOGI("Initializing FluxEngine with modelDir: %s", modelDir.c_str());
 
+    // Set current working directory to modelDir so relative external_buffer paths (weights/dit_*.bin) always resolve
+    chdir(modelDir.c_str());
+
     if (!loadTimeGuidanceBuffer()) {
         LOGE("Failed to load time_guidance_embed_bf16.bin");
         return false;
     }
 
-    mapWeightSidecars();
     isInitialized = true;
     LOGI("FluxEngine successfully initialized");
     return true;

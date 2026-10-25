@@ -3,6 +3,9 @@ package com.gestura.fluxedit.pipeline
 import android.util.Log
 import com.gestura.fluxedit.engine.FluxNativeEngine
 import com.gestura.fluxedit.tokenizer.TokenizedPrompt
+import com.google.ai.edge.litert.Accelerator
+import com.google.ai.edge.litert.CompiledModel
+import com.google.ai.edge.litert.TensorBuffer
 import org.tensorflow.lite.Interpreter
 import java.io.File
 import java.io.RandomAccessFile
@@ -12,10 +15,6 @@ import java.nio.channels.FileChannel
 
 class TextEncoderRunner(private val modelDir: File) {
     private val TAG = "TextEncoderRunner"
-
-    private var interp0: Interpreter? = null
-    private var interp1: Interpreter? = null
-    private var interp2: Interpreter? = null
 
     private var embedTableChannel: FileChannel? = null
     private var embedRaf: RandomAccessFile? = null
@@ -28,18 +27,7 @@ class TextEncoderRunner(private val modelDir: File) {
     }
 
     fun init() {
-        val f0 = File(modelDir, "ke_enc0.tflite")
-        val f1 = File(modelDir, "ke_enc1.tflite")
-        val f2 = File(modelDir, "ke_enc2.tflite")
-
-        val options = Interpreter.Options().apply {
-            numThreads = 4
-        }
-
-        if (f0.exists()) interp0 = Interpreter(f0, options)
-        if (f1.exists()) interp1 = Interpreter(f1, options)
-        if (f2.exists()) interp2 = Interpreter(f2, options)
-
+        if (embedTableChannel != null) return
         val embedFile = File(modelDir, "tokenizer/qwen_embed_fp16.bin")
         if (embedFile.exists()) {
             embedRaf = RandomAccessFile(embedFile, "r")
@@ -48,16 +36,20 @@ class TextEncoderRunner(private val modelDir: File) {
     }
 
     fun close() {
-        interp0?.close()
-        interp1?.close()
-        interp2?.close()
-        embedTableChannel?.close()
-        embedRaf?.close()
+        try {
+            embedTableChannel?.close()
+        } catch (_: Exception) {}
+        try {
+            embedRaf?.close()
+        } catch (_: Exception) {}
+        embedTableChannel = null
+        embedRaf = null
     }
 
-    fun lookupEmbeddings(tokenIds: IntArray): ByteBuffer {
-        val embedBuffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
-        val channel = embedTableChannel ?: return embedBuffer
+    fun lookupEmbeddingsFloatArray(tokenIds: IntArray): FloatArray {
+        init()
+        val out = FloatArray(1 * SEQ_LEN * HIDDEN_DIM)
+        val channel = embedTableChannel ?: return out
 
         val rowBuffer = ByteBuffer.allocateDirect(BYTES_PER_FP16_ROW).order(ByteOrder.LITTLE_ENDIAN)
 
@@ -68,143 +60,158 @@ class TextEncoderRunner(private val modelDir: File) {
             channel.read(rowBuffer, offset)
             rowBuffer.flip()
 
+            val baseIdx = i * HIDDEN_DIM
             for (j in 0 until HIDDEN_DIM) {
                 val halfBits = rowBuffer.short.toInt() and 0xFFFF
-                embedBuffer.putFloat(fp16ToFp32(halfBits))
+                out[baseIdx + j] = fp16ToFp32(halfBits)
             }
         }
-        embedBuffer.rewind()
-        return embedBuffer
+        return out
+    }
+
+    /**
+     * Runs a single 923 MB Qwen3 text encoder stage and immediately closes its native model
+     * so two 923 MB stages are never resident in memory simultaneously.
+     */
+    private fun runSingleEncoderStage(
+        fileName: String,
+        hiddenIn: FloatArray,
+        maskArray: FloatArray,
+        cosArray: FloatArray,
+        sinArray: FloatArray
+    ): FloatArray {
+        val stageFile = File(modelDir, fileName)
+        if (!stageFile.exists()) {
+            throw IllegalStateException("Missing text encoder stage file: ${stageFile.absolutePath}")
+        }
+        val sigName = "text_512"
+        val outElements = 1 * SEQ_LEN * HIDDEN_DIM
+
+        // Primary execution via LiteRT CompiledModel (only initializes the requested signature)
+        var model: CompiledModel? = null
+        var inputBuffers: Map<String, TensorBuffer>? = null
+        var outputBuffers: Map<String, TensorBuffer>? = null
+        try {
+            model = CompiledModel.create(
+                stageFile.absolutePath,
+                CompiledModel.Options(Accelerator.CPU)
+            )
+            inputBuffers = model.createInputBuffersBySignature(sigName)
+            outputBuffers = model.createOutputBuffersBySignature(sigName)
+
+            inputBuffers["args_0"]?.writeFloat(hiddenIn)
+                ?: throw IllegalStateException("$fileName missing input 'args_0'")
+            inputBuffers["args_1"]?.writeFloat(maskArray)
+                ?: throw IllegalStateException("$fileName missing input 'args_1'")
+            inputBuffers["args_2"]?.writeFloat(cosArray)
+                ?: throw IllegalStateException("$fileName missing input 'args_2'")
+            inputBuffers["args_3"]?.writeFloat(sinArray)
+                ?: throw IllegalStateException("$fileName missing input 'args_3'")
+
+            model.run(inputBuffers, outputBuffers, sigName)
+
+            val outBuf = outputBuffers["output_0"]
+                ?: throw IllegalStateException("$fileName missing output 'output_0'")
+            return outBuf.readFloat()
+        } catch (litertErr: Throwable) {
+            Log.w(TAG, "CompiledModel fallback to Interpreter for $fileName: ${litertErr.message}")
+        } finally {
+            inputBuffers?.values?.forEach { try { it.close() } catch (_: Throwable) {} }
+            outputBuffers?.values?.forEach { try { it.close() } catch (_: Throwable) {} }
+            try { model?.close() } catch (_: Throwable) {}
+        }
+
+        // Fallback to single-stage TFLite Interpreter (closed immediately in finally)
+        val options = Interpreter.Options().apply {
+            numThreads = 4
+        }
+        var interp: Interpreter? = null
+        try {
+            interp = Interpreter(stageFile, options)
+            val in0 = floatArrayToDirectBuffer(hiddenIn)
+            val in1 = floatArrayToDirectBuffer(maskArray)
+            val in2 = floatArrayToDirectBuffer(cosArray)
+            val in3 = floatArrayToDirectBuffer(sinArray)
+            val out0 = ByteBuffer.allocateDirect(outElements * 4).order(ByteOrder.nativeOrder())
+
+            val inputs = mapOf(
+                "args_0" to in0,
+                "args_1" to in1,
+                "args_2" to in2,
+                "args_3" to in3
+            )
+            val outputs = mapOf(
+                "output_0" to out0
+            )
+            interp.runSignature(inputs, outputs, sigName)
+            out0.rewind()
+            val result = FloatArray(outElements)
+            out0.asFloatBuffer().get(result)
+            return result
+        } finally {
+            try { interp?.close() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun floatArrayToDirectBuffer(arr: FloatArray): ByteBuffer {
+        val buf = ByteBuffer.allocateDirect(arr.size * 4).order(ByteOrder.nativeOrder())
+        buf.asFloatBuffer().put(arr)
+        buf.rewind()
+        return buf
     }
 
     fun encode(tokenized: TokenizedPrompt): FloatArray {
-        val promptConditioning = FloatArray(SEQ_LEN * PROMPT_COND_DIM)
-
         // 1. Embedding lookup [1, 512, 2560]
-        val embedBuffer = lookupEmbeddings(tokenized.tokenIds)
+        val embedArray = lookupEmbeddingsFloatArray(tokenized.tokenIds)
 
-        // 2. 4D Attention mask [1, 32, 512, 512] in direct ByteBuffer
-        val maskBuffer = ByteBuffer.allocateDirect(1 * 32 * SEQ_LEN * SEQ_LEN * 4).order(ByteOrder.nativeOrder())
+        // 2. 4D Attention mask [1, 32, 512, 512]
+        val maskArray = FloatArray(1 * 32 * SEQ_LEN * SEQ_LEN)
         val activeLen = tokenized.unpaddedLength
-        for (head in 0 until 32) {
-            for (q in 0 until SEQ_LEN) {
-                for (k in 0 until SEQ_LEN) {
-                    val isVisible = (k < activeLen && k <= q)
-                    maskBuffer.putFloat(if (isVisible) 0.0f else -10000.0f)
-                }
+        val headStride = SEQ_LEN * SEQ_LEN
+        for (q in 0 until SEQ_LEN) {
+            val rowOffset = q * SEQ_LEN
+            for (k in 0 until SEQ_LEN) {
+                val isVisible = (k < activeLen && k <= q)
+                maskArray[rowOffset + k] = if (isVisible) 0.0f else -10000.0f
             }
         }
-        maskBuffer.rewind()
+        for (head in 1 until 32) {
+            System.arraycopy(maskArray, 0, maskArray, head * headStride, headStride)
+        }
 
         // 3. RoPE tensors for Qwen3 text: cos [512, 128] and sin [512, 128]
         // Qwen3 rotate_half slices [..., 64:128] and [..., 0:64], so each 128-dim row is [freqs_0..63, freqs_0..63]
         val ropeCombined = FloatArray(SEQ_LEN * 128)
         FluxNativeEngine.nativeComputeRoPEText(ropeCombined, SEQ_LEN, 128)
 
-        val cosBuffer = ByteBuffer.allocateDirect(SEQ_LEN * 128 * 4).order(ByteOrder.nativeOrder())
-        val sinBuffer = ByteBuffer.allocateDirect(SEQ_LEN * 128 * 4).order(ByteOrder.nativeOrder())
+        val cosArray = FloatArray(SEQ_LEN * 128)
+        val sinArray = FloatArray(SEQ_LEN * 128)
 
         for (pos in 0 until SEQ_LEN) {
             val baseIdx = pos * 128
-            // First half (0..63)
             for (d in 0 until 64) {
-                cosBuffer.putFloat(ropeCombined[baseIdx + d * 2])
-                sinBuffer.putFloat(ropeCombined[baseIdx + d * 2 + 1])
-            }
-            // Second half (64..127) duplicates (0..63) for rotate_half pairing
-            for (d in 0 until 64) {
-                cosBuffer.putFloat(ropeCombined[baseIdx + d * 2])
-                sinBuffer.putFloat(ropeCombined[baseIdx + d * 2 + 1])
-            }
-        }
-        cosBuffer.rewind()
-        sinBuffer.rewind()
-
-        // Buffers for the 3 hidden state taps (layers 9, 18, 27), each [1, 512, 2560]
-        val tap0Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
-        val tap1Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
-        val tap2Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
-
-        val sigName = "text_512"
-
-        // Stage 0 (layers 0..8 -> outputs hidden_states[9] as output_0)
-        interp0?.let { interp ->
-            val inputs = mapOf(
-                "args_0" to embedBuffer,
-                "args_1" to maskBuffer,
-                "args_2" to cosBuffer,
-                "args_3" to sinBuffer
-            )
-            val outputs = mapOf(
-                "output_0" to tap0Buffer
-            )
-            try {
-                interp.runSignature(inputs, outputs, sigName)
-            } catch (e: Exception) {
-                Log.e(TAG, "Stage 0 execution failed: ${e.message}", e)
+                val c = ropeCombined[baseIdx + d * 2]
+                val s = ropeCombined[baseIdx + d * 2 + 1]
+                cosArray[baseIdx + d] = c
+                sinArray[baseIdx + d] = s
+                cosArray[baseIdx + 64 + d] = c
+                sinArray[baseIdx + 64 + d] = s
             }
         }
 
-        // Stage 1 (layers 9..17 -> takes tap0Buffer, outputs hidden_states[18] as output_0)
-        tap0Buffer.rewind()
-        maskBuffer.rewind()
-        cosBuffer.rewind()
-        sinBuffer.rewind()
-        interp1?.let { interp ->
-            val inputs = mapOf(
-                "args_0" to tap0Buffer,
-                "args_1" to maskBuffer,
-                "args_2" to cosBuffer,
-                "args_3" to sinBuffer
-            )
-            val outputs = mapOf(
-                "output_0" to tap1Buffer
-            )
-            try {
-                interp.runSignature(inputs, outputs, sigName)
-            } catch (e: Exception) {
-                Log.e(TAG, "Stage 1 execution failed: ${e.message}", e)
-            }
-        }
-
-        // Stage 2 (layers 18..26 -> takes tap1Buffer, outputs hidden_states[27] as output_0)
-        tap1Buffer.rewind()
-        maskBuffer.rewind()
-        cosBuffer.rewind()
-        sinBuffer.rewind()
-        interp2?.let { interp ->
-            val inputs = mapOf(
-                "args_0" to tap1Buffer,
-                "args_1" to maskBuffer,
-                "args_2" to cosBuffer,
-                "args_3" to sinBuffer
-            )
-            val outputs = mapOf(
-                "output_0" to tap2Buffer
-            )
-            try {
-                interp.runSignature(inputs, outputs, sigName)
-            } catch (e: Exception) {
-                Log.e(TAG, "Stage 2 execution failed: ${e.message}", e)
-            }
-        }
+        // Execute Stage 0, Stage 1, Stage 2 strictly sequentially (closing each 923MB model before loading the next)
+        val tap0 = runSingleEncoderStage("ke_enc0.tflite", embedArray, maskArray, cosArray, sinArray)
+        val tap1 = runSingleEncoderStage("ke_enc1.tflite", tap0, maskArray, cosArray, sinArray)
+        val tap2 = runSingleEncoderStage("ke_enc2.tflite", tap1, maskArray, cosArray, sinArray)
 
         // Compose 7,680-dim prompt conditioning by concatenating [tap0, tap1, tap2] per token
-        tap0Buffer.rewind()
-        tap1Buffer.rewind()
-        tap2Buffer.rewind()
-
+        val promptConditioning = FloatArray(SEQ_LEN * PROMPT_COND_DIM)
         for (i in 0 until SEQ_LEN) {
+            val srcOffset = i * HIDDEN_DIM
             val condOffset = i * PROMPT_COND_DIM
-            for (j in 0 until HIDDEN_DIM) {
-                promptConditioning[condOffset + j] = if (tap0Buffer.hasRemaining()) tap0Buffer.getFloat() else 0f
-            }
-            for (j in 0 until HIDDEN_DIM) {
-                promptConditioning[condOffset + HIDDEN_DIM + j] = if (tap1Buffer.hasRemaining()) tap1Buffer.getFloat() else 0f
-            }
-            for (j in 0 until HIDDEN_DIM) {
-                promptConditioning[condOffset + 2 * HIDDEN_DIM + j] = if (tap2Buffer.hasRemaining()) tap2Buffer.getFloat() else 0f
-            }
+            System.arraycopy(tap0, srcOffset, promptConditioning, condOffset, HIDDEN_DIM)
+            System.arraycopy(tap1, srcOffset, promptConditioning, condOffset + HIDDEN_DIM, HIDDEN_DIM)
+            System.arraycopy(tap2, srcOffset, promptConditioning, condOffset + 2 * HIDDEN_DIM, HIDDEN_DIM)
         }
 
         return promptConditioning

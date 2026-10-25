@@ -29,9 +29,8 @@ class QwenBpeTokenizer {
         const val THINK_END_ID = 151668
     }
 
-    private val vocab = HashMap<String, Int>()
-    private val inverseVocab = HashMap<Int, String>()
-    private val bpeRanks = HashMap<Pair<String, String>, Int>()
+    private val vocab = HashMap<String, Int>(200000)
+    private val bpeRanks = HashMap<String, Int>(200000)
     private val specialTokens = HashMap<String, Int>()
 
     private val byteEncoder = HashMap<Int, String>()
@@ -57,7 +56,6 @@ class QwenBpeTokenizer {
         for ((tok, id) in defaults) {
             specialTokens[tok] = id
             vocab[tok] = id
-            inverseVocab[id] = tok
         }
     }
 
@@ -95,17 +93,16 @@ class QwenBpeTokenizer {
 
     fun loadVocab(inputStream: InputStream) {
         vocab.clear()
-        inverseVocab.clear()
         initDefaultSpecialTokens()
+        val wsRegex = Regex("\\s+")
         inputStream.bufferedReader().useLines { lines ->
             var idx = 0
             for (line in lines) {
                 if (line.isNotEmpty()) {
-                    val parts = line.split(" ", limit = 2)
+                    val parts = line.split(wsRegex, limit = 2)
                     val token = parts[0]
                     val id = if (parts.size > 1) parts[1].toIntOrNull() ?: idx else idx
                     vocab[token] = id
-                    inverseVocab[id] = token
                     if (id >= PAD_TOKEN_ID || (token.startsWith("<|") && token.endsWith("|>")) ||
                         token == THINK_START || token == THINK_END
                     ) {
@@ -124,27 +121,26 @@ class QwenBpeTokenizer {
             for (line in lines) {
                 val trimmed = line.trim()
                 if (trimmed.isEmpty() || trimmed.startsWith("#")) continue
-                val parts = trimmed.split(" ")
-                if (parts.size == 2) {
-                    bpeRanks[Pair(parts[0], parts[1])] = rank++
+                if (trimmed.indexOf(' ') > 0) {
+                    bpeRanks[trimmed] = rank++
                 }
             }
         }
     }
 
     fun loadSpecialTokens(inputStream: InputStream) {
-        specialTokens.clear()
+        initDefaultSpecialTokens()
+        val wsRegex = Regex("\\s+")
         inputStream.bufferedReader().useLines { lines ->
             for (line in lines) {
                 val trimmed = line.trim()
                 if (trimmed.isNotEmpty()) {
-                    val parts = trimmed.split(" ", limit = 2)
+                    val parts = trimmed.split(wsRegex, limit = 2)
                     if (parts.size == 2) {
                         val id = parts[1].toIntOrNull()
                         if (id != null) {
                             specialTokens[parts[0]] = id
                             vocab[parts[0]] = id
-                            inverseVocab[id] = parts[0]
                         }
                     }
                 }
@@ -180,7 +176,7 @@ class QwenBpeTokenizer {
             var minRank = Int.MAX_VALUE
             var bestPair: Pair<String, String>? = null
             for (pair in pairs) {
-                val rank = bpeRanks[pair] ?: Int.MAX_VALUE
+                val rank = bpeRanks["${pair.first} ${pair.second}"] ?: Int.MAX_VALUE
                 if (rank < minRank) {
                     minRank = rank
                     bestPair = pair

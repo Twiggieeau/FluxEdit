@@ -22,6 +22,11 @@ class QwenBpeTokenizer {
         const val IM_END = "<|im_end|>"
         const val THINK_START = "<think>"
         const val THINK_END = "</think>"
+
+        const val IM_START_ID = 151644
+        const val IM_END_ID = 151645
+        const val THINK_START_ID = 151667
+        const val THINK_END_ID = 151668
     }
 
     private val vocab = HashMap<String, Int>()

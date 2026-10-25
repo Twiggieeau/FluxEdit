@@ -36,29 +36,26 @@ class VaePipeline(private val modelDir: File) {
 
         // Primary execution via LiteRT CompiledModel (only initializes requested geometry signature)
         var model: CompiledModel? = null
-        var inputBuffers: Map<String, TensorBuffer>? = null
-        var outputBuffers: Map<String, TensorBuffer>? = null
+        val inputBuffers = HashMap<String, TensorBuffer>(1)
+        val outputBuffers = HashMap<String, TensorBuffer>(1)
         try {
             model = CompiledModel.create(
                 modelFile.absolutePath,
                 CompiledModel.Options(Accelerator.CPU)
             )
-            inputBuffers = model.createInputBuffersBySignature(signatureName)
-            outputBuffers = model.createOutputBuffersBySignature(signatureName)
-
-            inputBuffers["args_0"]?.writeFloat(inputArray)
-                ?: throw IllegalStateException("$fileName missing input 'args_0'")
+            inputBuffers["args_0"] = model.createInputBuffer(signatureName, "args_0").also {
+                it.writeFloat(inputArray)
+            }
+            val outBuf = model.createOutputBuffer(signatureName, "output_0")
+            outputBuffers["output_0"] = outBuf
 
             model.run(inputBuffers, outputBuffers, signatureName)
-
-            val outBuf = outputBuffers["output_0"]
-                ?: throw IllegalStateException("$fileName missing output 'output_0'")
             return outBuf.readFloat()
         } catch (litertErr: Throwable) {
             Log.w(TAG, "CompiledModel fallback to Interpreter for $fileName ($signatureName): ${litertErr.message}")
         } finally {
-            inputBuffers?.values?.forEach { try { it.close() } catch (_: Throwable) {} }
-            outputBuffers?.values?.forEach { try { it.close() } catch (_: Throwable) {} }
+            inputBuffers.values.forEach { try { it.close() } catch (_: Throwable) {} }
+            outputBuffers.values.forEach { try { it.close() } catch (_: Throwable) {} }
             try { model?.close() } catch (_: Throwable) {}
         }
 

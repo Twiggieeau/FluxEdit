@@ -89,35 +89,28 @@ class TextEncoderRunner(private val modelDir: File) {
 
         // Primary execution via LiteRT CompiledModel (only initializes the requested signature)
         var model: CompiledModel? = null
-        var inputBuffers: Map<String, TensorBuffer>? = null
-        var outputBuffers: Map<String, TensorBuffer>? = null
+        val inputBuffers = HashMap<String, TensorBuffer>(4)
+        val outputBuffers = HashMap<String, TensorBuffer>(1)
         try {
             model = CompiledModel.create(
                 stageFile.absolutePath,
                 CompiledModel.Options(Accelerator.CPU)
             )
-            inputBuffers = model.createInputBuffersBySignature(sigName)
-            outputBuffers = model.createOutputBuffersBySignature(sigName)
+            inputBuffers["args_0"] = model.createInputBuffer(sigName, "args_0").also { it.writeFloat(hiddenIn) }
+            inputBuffers["args_1"] = model.createInputBuffer(sigName, "args_1").also { it.writeFloat(maskArray) }
+            inputBuffers["args_2"] = model.createInputBuffer(sigName, "args_2").also { it.writeFloat(cosArray) }
+            inputBuffers["args_3"] = model.createInputBuffer(sigName, "args_3").also { it.writeFloat(sinArray) }
 
-            inputBuffers["args_0"]?.writeFloat(hiddenIn)
-                ?: throw IllegalStateException("$fileName missing input 'args_0'")
-            inputBuffers["args_1"]?.writeFloat(maskArray)
-                ?: throw IllegalStateException("$fileName missing input 'args_1'")
-            inputBuffers["args_2"]?.writeFloat(cosArray)
-                ?: throw IllegalStateException("$fileName missing input 'args_2'")
-            inputBuffers["args_3"]?.writeFloat(sinArray)
-                ?: throw IllegalStateException("$fileName missing input 'args_3'")
+            val outBuf = model.createOutputBuffer(sigName, "output_0")
+            outputBuffers["output_0"] = outBuf
 
             model.run(inputBuffers, outputBuffers, sigName)
-
-            val outBuf = outputBuffers["output_0"]
-                ?: throw IllegalStateException("$fileName missing output 'output_0'")
             return outBuf.readFloat()
         } catch (litertErr: Throwable) {
             Log.w(TAG, "CompiledModel fallback to Interpreter for $fileName: ${litertErr.message}")
         } finally {
-            inputBuffers?.values?.forEach { try { it.close() } catch (_: Throwable) {} }
-            outputBuffers?.values?.forEach { try { it.close() } catch (_: Throwable) {} }
+            inputBuffers.values.forEach { try { it.close() } catch (_: Throwable) {} }
+            outputBuffers.values.forEach { try { it.close() } catch (_: Throwable) {} }
             try { model?.close() } catch (_: Throwable) {}
         }
 

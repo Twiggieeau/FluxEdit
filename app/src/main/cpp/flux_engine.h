@@ -39,9 +39,11 @@ public:
     // Rotary Positional Embedding (RoPE) tensor generators
     bool computeRoPEImage(float* outRotary, int height, int width, int hiddenDim = 128);
     bool computeRoPEText(float* outRotary, int seqLen = 512, int hiddenDim = 128);
+    bool computeJointRoPE(float* outCos, float* outSin, int height, int width, int textSeqLen, int numCondImages);
 
-    // Time & Guidance vector lookup (3,072 dimensions)
+    // Time & Guidance vector computation (3,072 dimensions)
     bool readTimeGuidanceEmbed(int stepIdx, float* outEmbed3072);
+    bool computeTimeGuidanceEmbed(float timestep1000, float* outEmbed3072);
 
     // Flow scheduler Euler step: x_{t+1} = x_t + dt * v
     bool eulerStep(float* noisyLatent, const float* velocity, int numElements, float dt);

@@ -96,7 +96,8 @@ class TextEncoderRunner(private val modelDir: File) {
         }
         maskBuffer.rewind()
 
-        // 3. RoPE tensors for text: cos [512, 128] and sin [512, 128]
+        // 3. RoPE tensors for Qwen3 text: cos [512, 128] and sin [512, 128]
+        // Qwen3 rotate_half slices [..., 64:128] and [..., 0:64], so each 128-dim row is [freqs_0..63, freqs_0..63]
         val ropeCombined = FloatArray(SEQ_LEN * 128)
         FluxNativeEngine.nativeComputeRoPEText(ropeCombined, SEQ_LEN, 128)
 
@@ -104,28 +105,29 @@ class TextEncoderRunner(private val modelDir: File) {
         val sinBuffer = ByteBuffer.allocateDirect(SEQ_LEN * 128 * 4).order(ByteOrder.nativeOrder())
 
         for (pos in 0 until SEQ_LEN) {
+            val baseIdx = pos * 128
+            // First half (0..63)
             for (d in 0 until 64) {
-                val cosVal = ropeCombined[pos * 128 + d * 2]
-                val sinVal = ropeCombined[pos * 128 + d * 2 + 1]
-                cosBuffer.putFloat(cosVal)
-                cosBuffer.putFloat(cosVal)
-                sinBuffer.putFloat(sinVal)
-                sinBuffer.putFloat(sinVal)
+                cosBuffer.putFloat(ropeCombined[baseIdx + d * 2])
+                sinBuffer.putFloat(ropeCombined[baseIdx + d * 2 + 1])
+            }
+            // Second half (64..127) duplicates (0..63) for rotate_half pairing
+            for (d in 0 until 64) {
+                cosBuffer.putFloat(ropeCombined[baseIdx + d * 2])
+                sinBuffer.putFloat(ropeCombined[baseIdx + d * 2 + 1])
             }
         }
         cosBuffer.rewind()
         sinBuffer.rewind()
 
-        // Buffers for taps [1, 512, 2560]
+        // Buffers for the 3 hidden state taps (layers 9, 18, 27), each [1, 512, 2560]
         val tap0Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
-        val inter0Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
         val tap1Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
-        val inter1Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
         val tap2Buffer = ByteBuffer.allocateDirect(1 * SEQ_LEN * HIDDEN_DIM * 4).order(ByteOrder.nativeOrder())
 
         val sigName = "text_512"
 
-        // Stage 0
+        // Stage 0 (layers 0..8 -> outputs hidden_states[9] as output_0)
         interp0?.let { interp ->
             val inputs = mapOf(
                 "args_0" to embedBuffer,
@@ -134,46 +136,45 @@ class TextEncoderRunner(private val modelDir: File) {
                 "args_3" to sinBuffer
             )
             val outputs = mapOf(
-                "output_0" to inter0Buffer,
-                "output_1" to tap0Buffer
+                "output_0" to tap0Buffer
             )
             try {
                 interp.runSignature(inputs, outputs, sigName)
             } catch (e: Exception) {
-                Log.w(TAG, "Stage 0 signature fallback: ${e.message}")
+                Log.e(TAG, "Stage 0 execution failed: ${e.message}", e)
             }
         }
 
-        // Stage 1
-        inter1Buffer.rewind()
+        // Stage 1 (layers 9..17 -> takes tap0Buffer, outputs hidden_states[18] as output_0)
+        tap0Buffer.rewind()
         maskBuffer.rewind()
         cosBuffer.rewind()
         sinBuffer.rewind()
         interp1?.let { interp ->
             val inputs = mapOf(
-                "args_0" to inter0Buffer,
+                "args_0" to tap0Buffer,
                 "args_1" to maskBuffer,
                 "args_2" to cosBuffer,
                 "args_3" to sinBuffer
             )
             val outputs = mapOf(
-                "output_0" to inter1Buffer,
-                "output_1" to tap1Buffer
+                "output_0" to tap1Buffer
             )
             try {
                 interp.runSignature(inputs, outputs, sigName)
             } catch (e: Exception) {
-                Log.w(TAG, "Stage 1 signature fallback: ${e.message}")
+                Log.e(TAG, "Stage 1 execution failed: ${e.message}", e)
             }
         }
 
-        // Stage 2
+        // Stage 2 (layers 18..26 -> takes tap1Buffer, outputs hidden_states[27] as output_0)
+        tap1Buffer.rewind()
         maskBuffer.rewind()
         cosBuffer.rewind()
         sinBuffer.rewind()
         interp2?.let { interp ->
             val inputs = mapOf(
-                "args_0" to inter1Buffer,
+                "args_0" to tap1Buffer,
                 "args_1" to maskBuffer,
                 "args_2" to cosBuffer,
                 "args_3" to sinBuffer
@@ -184,11 +185,11 @@ class TextEncoderRunner(private val modelDir: File) {
             try {
                 interp.runSignature(inputs, outputs, sigName)
             } catch (e: Exception) {
-                Log.w(TAG, "Stage 2 signature fallback: ${e.message}")
+                Log.e(TAG, "Stage 2 execution failed: ${e.message}", e)
             }
         }
 
-        // Compose 7,680-dim prompt conditioning
+        // Compose 7,680-dim prompt conditioning by concatenating [tap0, tap1, tap2] per token
         tap0Buffer.rewind()
         tap1Buffer.rewind()
         tap2Buffer.rewind()

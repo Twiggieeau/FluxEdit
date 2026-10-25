@@ -52,7 +52,16 @@ object FluxNativeEngine {
         seqLen: Int = 512,
         hiddenDim: Int = 128
     ): Boolean
+    external fun nativeComputeJointRoPE(
+        outCos: FloatArray,
+        outSin: FloatArray,
+        height: Int,
+        width: Int,
+        textSeqLen: Int = 512,
+        numCondImages: Int = 0
+    ): Boolean
     external fun nativeReadTimeGuidanceEmbed(stepIdx: Int, outEmbed: FloatArray): Boolean
+    external fun nativeComputeTimeGuidanceEmbed(timestep1000: Float, outEmbed: FloatArray): Boolean
     external fun nativeEulerStep(
         noisyLatent: FloatArray,
         velocity: FloatArray,

@@ -38,6 +38,22 @@ class QwenBpeTokenizer {
 
     init {
         initByteEncoder()
+        initDefaultSpecialTokens()
+    }
+
+    private fun initDefaultSpecialTokens() {
+        val defaults = mapOf(
+            "<|endoftext|>" to 151643,
+            "<|im_start|>" to 151644,
+            "<|im_end|>" to 151645,
+            "<think>" to 151667,
+            "</think>" to 151668
+        )
+        for ((tok, id) in defaults) {
+            specialTokens[tok] = id
+            vocab[tok] = id
+            inverseVocab[id] = tok
+        }
     }
 
     private fun initByteEncoder() {
@@ -75,6 +91,7 @@ class QwenBpeTokenizer {
     fun loadVocab(inputStream: InputStream) {
         vocab.clear()
         inverseVocab.clear()
+        initDefaultSpecialTokens()
         inputStream.bufferedReader().useLines { lines ->
             var idx = 0
             for (line in lines) {
@@ -84,6 +101,11 @@ class QwenBpeTokenizer {
                     val id = if (parts.size > 1) parts[1].toIntOrNull() ?: idx else idx
                     vocab[token] = id
                     inverseVocab[id] = token
+                    if (id >= PAD_TOKEN_ID || (token.startsWith("<|") && token.endsWith("|>")) ||
+                        token == THINK_START || token == THINK_END
+                    ) {
+                        specialTokens[token] = id
+                    }
                     idx++
                 }
             }
@@ -182,20 +204,10 @@ class QwenBpeTokenizer {
         return word
     }
 
-    fun encodeText(text: String): List<Int> {
-        val result = ArrayList<Int>()
-        val matcher = splitPattern.matcher(text)
-
+    private fun encodeSegment(segment: String, result: MutableList<Int>) {
+        val matcher = splitPattern.matcher(segment)
         while (matcher.find()) {
             val tokenStr = matcher.group()
-            // Check special tokens
-            val specialId = specialTokens[tokenStr]
-            if (specialId != null) {
-                result.add(specialId)
-                continue
-            }
-
-            // Byte encode
             val utf8Bytes = tokenStr.toByteArray(Charsets.UTF_8)
             val byteEncoded = buildString {
                 for (b in utf8Bytes) {
@@ -209,6 +221,39 @@ class QwenBpeTokenizer {
                 if (id != null) {
                     result.add(id)
                 }
+            }
+        }
+    }
+
+    fun encodeText(text: String): List<Int> {
+        val result = ArrayList<Int>()
+        if (specialTokens.isEmpty()) {
+            encodeSegment(text, result)
+            return result
+        }
+
+        val sortedSpecials = specialTokens.keys.sortedByDescending { it.length }
+        var pos = 0
+        while (pos < text.length) {
+            var earliestIdx = Int.MAX_VALUE
+            var matchedSpecial: String? = null
+            for (spec in sortedSpecials) {
+                val idx = text.indexOf(spec, pos)
+                if (idx != -1 && idx < earliestIdx) {
+                    earliestIdx = idx
+                    matchedSpecial = spec
+                }
+            }
+
+            if (matchedSpecial == null) {
+                encodeSegment(text.substring(pos), result)
+                break
+            } else {
+                if (earliestIdx > pos) {
+                    encodeSegment(text.substring(pos, earliestIdx), result)
+                }
+                specialTokens[matchedSpecial]?.let { result.add(it) }
+                pos = earliestIdx + matchedSpecial.length
             }
         }
         return result

@@ -80,8 +80,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
-    // TensorFlow Lite / LiteRT API
-    implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    // Google AI Edge LiteRT API (supports external_buffers / LiteRtWeightLoader and 4-bit blockwise quantization)
+    implementation("com.google.ai.edge.litert:litert:2.3.0")
+    implementation("com.google.ai.edge.litert:litert-api:2.3.0")
 
     // Testing
     testImplementation("junit:junit:4.13.2")

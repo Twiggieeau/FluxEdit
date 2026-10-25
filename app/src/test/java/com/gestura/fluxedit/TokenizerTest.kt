@@ -30,4 +30,16 @@ class TokenizerTest {
         assertEquals(QwenBpeTokenizer.PAD_TOKEN_ID, tokenized.tokenIds[lastIdx])
         assertEquals(0.0f, tokenized.attentionMask[lastIdx], 1e-6f)
     }
+
+    @Test
+    fun testSpecialTokenSplitting() {
+        val tokenizer = QwenBpeTokenizer()
+        val tokenized = tokenizer.encodePromptWithTemplate("apple")
+
+        // First token must be <|im_start|> (151644), not split into '<', '|', 'im', etc.
+        assertEquals(QwenBpeTokenizer.IM_START_ID, tokenized.tokenIds[0])
+        assertTrue(tokenized.tokenIds.contains(QwenBpeTokenizer.IM_END_ID))
+        assertTrue(tokenized.tokenIds.contains(QwenBpeTokenizer.THINK_START_ID))
+        assertTrue(tokenized.tokenIds.contains(QwenBpeTokenizer.THINK_END_ID))
+    }
 }

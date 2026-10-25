@@ -136,6 +136,25 @@ Java_com_gestura_fluxedit_engine_FluxNativeEngine_nativeComputeRoPEText(
 }
 
 JNIEXPORT jboolean JNICALL
+Java_com_gestura_fluxedit_engine_FluxNativeEngine_nativeComputeJointRoPE(
+    JNIEnv* env,
+    jobject /* this */,
+    jfloatArray jOutCos,
+    jfloatArray jOutSin,
+    jint height,
+    jint width,
+    jint textSeqLen,
+    jint numCondImages) {
+    if (!gEngine || !jOutCos || !jOutSin) return JNI_FALSE;
+    jfloat* cosPtr = env->GetFloatArrayElements(jOutCos, nullptr);
+    jfloat* sinPtr = env->GetFloatArrayElements(jOutSin, nullptr);
+    bool ok = gEngine->computeJointRoPE(cosPtr, sinPtr, height, width, textSeqLen, numCondImages);
+    env->ReleaseFloatArrayElements(jOutCos, cosPtr, 0);
+    env->ReleaseFloatArrayElements(jOutSin, sinPtr, 0);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
 Java_com_gestura_fluxedit_engine_FluxNativeEngine_nativeReadTimeGuidanceEmbed(
     JNIEnv* env,
     jobject /* this */,
@@ -144,6 +163,19 @@ Java_com_gestura_fluxedit_engine_FluxNativeEngine_nativeReadTimeGuidanceEmbed(
     if (!gEngine || !jOutEmbed) return JNI_FALSE;
     jfloat* ptr = env->GetFloatArrayElements(jOutEmbed, nullptr);
     bool ok = gEngine->readTimeGuidanceEmbed(stepIdx, ptr);
+    env->ReleaseFloatArrayElements(jOutEmbed, ptr, 0);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_gestura_fluxedit_engine_FluxNativeEngine_nativeComputeTimeGuidanceEmbed(
+    JNIEnv* env,
+    jobject /* this */,
+    jfloat timestep1000,
+    jfloatArray jOutEmbed) {
+    if (!gEngine || !jOutEmbed) return JNI_FALSE;
+    jfloat* ptr = env->GetFloatArrayElements(jOutEmbed, nullptr);
+    bool ok = gEngine->computeTimeGuidanceEmbed(timestep1000, ptr);
     env->ReleaseFloatArrayElements(jOutEmbed, ptr, 0);
     return ok ? JNI_TRUE : JNI_FALSE;
 }

@@ -22,8 +22,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -68,9 +70,16 @@ fun EditorScreen(
     onSaveToGallery: (Bitmap) -> Unit,
     onShareImage: (Bitmap) -> Unit
 ) {
+    val workflowTabs = remember {
+        listOf(
+            WorkflowType.SINGLE_IMAGE_EDIT,
+            WorkflowType.TWO_IMAGE_EDIT,
+            WorkflowType.TEXT_TO_IMAGE
+        )
+    }
     var selectedWorkflow by remember { mutableStateOf(WorkflowType.SINGLE_IMAGE_EDIT) }
     var prompt by remember { mutableStateOf("Turn the red apple into a vibrant green apple") }
-    var initStrength by remember { mutableStateOf(0.75f) }
+    var initStrength by remember { mutableStateOf(1.0f) }
     var selectedGeometry by remember { mutableStateOf(GEOMETRY_OPTIONS[0]) }
     var randomSeed by remember { mutableStateOf(true) }
     var customSeed by remember { mutableStateOf(42L) }
@@ -149,8 +158,9 @@ fun EditorScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             // Workflow mode selector
+            val selectedTabIndex = workflowTabs.indexOf(selectedWorkflow).coerceAtLeast(0)
             TabRow(
-                selectedTabIndex = selectedWorkflow.ordinal,
+                selectedTabIndex = selectedTabIndex,
                 containerColor = FluxCardDark,
                 contentColor = MaterialTheme.colorScheme.onSurface
             ) {
@@ -191,7 +201,7 @@ fun EditorScreen(
 
                     if (result != null && original != null && selectedWorkflow != WorkflowType.TEXT_TO_IMAGE) {
                         // Before / After Comparison View
-                        Box(
+                        BoxWithConstraints(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .pointerInput(Unit) {
@@ -201,7 +211,7 @@ fun EditorScreen(
                                     }
                                 }
                         ) {
-                            // After image
+                            // After image (full width, visible on right side)
                             Image(
                                 bitmap = result.asImageBitmap(),
                                 contentDescription = "Edited result",
@@ -209,13 +219,27 @@ fun EditorScreen(
                                 contentScale = ContentScale.Fit
                             )
 
+                            // Before image (clipped to left of splitPosition)
+                            Image(
+                                bitmap = original.asImageBitmap(),
+                                contentDescription = "Original image",
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .drawWithContent {
+                                        clipRect(right = size.width * splitPosition) {
+                                            this@drawWithContent.drawContent()
+                                        }
+                                    },
+                                contentScale = ContentScale.Fit
+                            )
+
                             // Split divider bar
                             Box(
                                 modifier = Modifier
                                     .fillMaxHeight()
-                                    .width(4.dp)
+                                    .width(3.dp)
                                     .align(Alignment.CenterStart)
-                                    .offset(x = (280 * splitPosition).dp)
+                                    .offset(x = maxWidth * splitPosition)
                                     .background(Color.White)
                             )
 
@@ -243,7 +267,7 @@ fun EditorScreen(
                             modifier = Modifier.fillMaxSize(),
                             contentScale = ContentScale.Fit
                         )
-                    } else if (original != null) {
+                    } else if (original != null && selectedWorkflow != WorkflowType.TEXT_TO_IMAGE) {
                         Image(
                             bitmap = original.asImageBitmap(),
                             contentDescription = "Original image",
@@ -434,7 +458,7 @@ fun EditorScreen(
                             is PipelineProgress.Tokenizing -> "Formatting prompt chat template & tokenizing..."
                             is PipelineProgress.EncodingText -> "Running 3-stage text encoder (ke_enc0..2)..."
                             is PipelineProgress.EncodingImages -> "Encoding image ${progress.current}/${progress.total} via VAE..."
-                            is PipelineProgress.Denoising -> "Denoising step ${progress.step}/${progress.totalSteps} (FLUX Euler)..."
+                            is PipelineProgress.Denoising -> "Denoising step ${progress.step}/${progress.totalSteps} (${progress.stageName})..."
                             is PipelineProgress.DecodingVae -> "Decoding VAE latents to output RGB image..."
                             is PipelineProgress.Completed -> "Generation complete in ${progress.durationMs / 1000.0}s!"
                             is PipelineProgress.Error -> "Error: ${progress.message}"
@@ -448,7 +472,7 @@ fun EditorScreen(
                             is PipelineProgress.Tokenizing -> 0.1f
                             is PipelineProgress.EncodingText -> 0.25f
                             is PipelineProgress.EncodingImages -> 0.4f
-                            is PipelineProgress.Denoising -> 0.5f + (progress.step.toFloat() / 4f) * 0.4f
+                            is PipelineProgress.Denoising -> 0.4f + progress.percent * 0.5f
                             is PipelineProgress.DecodingVae -> 0.95f
                             is PipelineProgress.Completed -> 1.0f
                             else -> 0f
@@ -465,6 +489,11 @@ fun EditorScreen(
 
             // Main Action Button
             val isGenerating = progress !is PipelineProgress.Idle && progress !is PipelineProgress.Completed && progress !is PipelineProgress.Error
+            val hasRequiredImages = when (selectedWorkflow) {
+                WorkflowType.TEXT_TO_IMAGE -> true
+                WorkflowType.SINGLE_IMAGE_EDIT -> image1Bitmap != null
+                WorkflowType.TWO_IMAGE_EDIT -> image1Bitmap != null && image2Bitmap != null
+            }
 
             Button(
                 onClick = {
@@ -482,7 +511,7 @@ fun EditorScreen(
                         )
                     )
                 },
-                enabled = isModelReady && !isGenerating && (selectedWorkflow == WorkflowType.TEXT_TO_IMAGE || image1Bitmap != null),
+                enabled = isModelReady && !isGenerating && hasRequiredImages,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp),
